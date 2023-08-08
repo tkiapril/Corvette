@@ -122,7 +122,10 @@ export async function emitter(
     },
   );
 
-  let finalizationQueue: (EventMessage & { url: string })[] = [];
+  let finalizationQueue: (
+    & EventMessage
+    & { retry: boolean; url: string[] }
+  )[] = [];
   await amqpChannel.consume(
     { queue: EvmEventsQueueName },
     async (args, _, data) => {
@@ -184,7 +187,26 @@ export async function emitter(
             formatDate(timestampDate, "yyyy-MM-dd HH:mm:ss")
           }.`,
         );
-        finalizationQueue.push({ ...message, url: x.webhookUrl });
+        let newEvt = true;
+        finalizationQueue = finalizationQueue.map((queuedItem) => {
+          if (
+            uint8ArrayEquals(queuedItem.blockHash, blockHash) &&
+            queuedItem.logIndex === logIndex
+          ) {
+            newEvt = false;
+            if (!queuedItem.url.includes(x.webhookUrl)) {
+              return { ...queuedItem, url: [...queuedItem.url, x.webhookUrl] };
+            }
+          }
+          return queuedItem;
+        });
+        if (newEvt) {
+          finalizationQueue.push({
+            ...message,
+            retry: false,
+            url: [x.webhookUrl],
+          });
+        }
       });
       logger.debug(
         `Acknowledging AMQP message for event, blockNumber: ${blockNumber}  logIndex: ${logIndex}  delivery tag: ${args.deliveryTag}.`,
@@ -243,14 +265,23 @@ export async function emitter(
     });
 
   async function blockFinalized(blockNumber: bigint) {
-    const observed = finalizationQueue.filter((x) =>
+    const { observed, toRetry } = finalizationQueue.filter((x) =>
       x.blockNumber <= blockNumber
+    ).reduce(
+      ({ observed, toRetry }, x) =>
+        x.retry
+          ? { observed, toRetry: [...toRetry, x] }
+          : { observed: [...observed, x], toRetry },
+      { observed: [], toRetry: [] } as {
+        observed: typeof finalizationQueue;
+        toRetry: typeof finalizationQueue;
+      },
     );
     if (observed.length <= 0) {
       logger.debug(
         `New finalized block at ${blockNumber}, but no events waiting in queue to be finalized.`,
       );
-      return;
+      if (toRetry.length <= 0) return;
     }
     logger.debug(() =>
       `Events to be finalized at ${blockNumber}  blockNumber-logIndex: ${
@@ -269,9 +300,11 @@ export async function emitter(
       const hash = (await client.getBlock({ blockNumber: x.blockNumber }))
         .hash;
 
-      const isFinal = toHex(x.blockHash) === hash;
-      if (isFinal) finalizedBlocks[hash] = x.blockNumber;
-      return isFinal ? [...(await acc), x] : acc;
+      if (toHex(x.blockHash) === hash) {
+        finalizedBlocks[hash] = x.blockNumber;
+        return [...(await acc), x];
+      }
+      return acc;
     }, Promise.resolve([] as typeof observed));
     logger.debug(() =>
       finalized.length > 0
@@ -282,12 +315,12 @@ export async function emitter(
         : `No finalized block at ${blockNumber}`
     );
 
-    await Promise.all(
-      finalized.map(async (x) => {
+    const nextRetry = (await Promise.all(
+      [...finalized, ...toRetry].map(async (x) => {
         logger.debug(
           `Retrieving event from DB, blockNumber: ${x.blockNumber}  logIndex: ${x.logIndex}.`,
         );
-        const event = await prisma.event.findUnique({
+        const evt = await prisma.event.findUnique({
           where: {
             blockTimestamp_logIndex: {
               blockTimestamp: new Date(
@@ -299,7 +332,7 @@ export async function emitter(
           include: { Abi: true },
         });
 
-        if (event == null) {
+        if (evt == null) {
           logger.error(() =>
             `Event does not exist in DB, blockNumber: ${x.blockNumber}  logIndex: ${x.logIndex}  blockHash: ${
               toHex(x.blockHash)
@@ -312,19 +345,36 @@ export async function emitter(
                 .join(" ")
             }.`
           );
-          return;
+          return undefined;
         }
 
-        logger.info(
-          `Posting event finalized at ${blockNumber}  destination: ${x.url}  blockNumber: ${x.blockNumber}  logIndex: ${x.logIndex}.`,
-        );
-        return fetch(x.url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: losslessJsonStringify(serializeEventResponse(event)),
-        });
+        const nextRetryUrls = (await Promise.all(x.url.map((url) => {
+          logger.info(
+            `${
+              x.retry
+                ? "Retry posting event"
+                : `Posting event finalized at ${blockNumber}`
+            }  destination: ${url}  blockNumber: ${x.blockNumber}  logIndex: ${x.logIndex}.`,
+          );
+          return fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: losslessJsonStringify(serializeEventResponse(evt)),
+          });
+        }))).filter((x) => !x.ok).map((x) => x.url);
+        if (nextRetryUrls.length <= 0) {
+          logger.info(
+            `Event post success for all webhook URLs, blockNumber: ${x.blockNumber}  logIndex: ${x.logIndex}.`,
+          );
+          return undefined;
+        } else {
+          logger.info(
+            `Event post failed for some webhook URLs, will retry on next block index, blockNumber: ${x.blockNumber}  logIndex: ${x.logIndex}  destinations: ${nextRetryUrls}.`,
+          );
+          return { ...x, retry: true, url: nextRetryUrls };
+        }
       }),
-    );
+    )).filter((x) => x != undefined) as typeof finalizationQueue;
 
     const ommer = observed.filter((x) =>
       finalizedBlocks[toHex(x.blockHash)] !== x.blockNumber
@@ -373,6 +423,7 @@ export async function emitter(
         }.`
         : "No events left in finalization queue."
     );
+    finalizationQueue = [...finalizationQueue, ...nextRetry];
   }
 
   const abortController = new AbortController();
