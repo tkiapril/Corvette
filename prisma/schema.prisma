@@ -25,6 +25,7 @@ model Event {
   topic2         Bytes?
   topic3         Bytes?
   data           Bytes
+  finalizedAt    Int?
 
   abiHash       Bytes
   sourceAddress Bytes

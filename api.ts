@@ -75,6 +75,7 @@ export function api(prisma: PrismaClient) {
               ),
             )),
         blockTimestamp: { gte: request.after, lte: request.before },
+        finalizedAt: { not: null },
       },
       include: { Abi: true },
     })).map((event) => serializeEventResponse(event)));

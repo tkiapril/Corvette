@@ -320,15 +320,14 @@ export async function emitter(
         logger.debug(
           `Retrieving event from DB, blockNumber: ${x.blockNumber}  logIndex: ${x.logIndex}.`,
         );
-        const evt = await prisma.event.findUnique({
-          where: {
-            blockTimestamp_logIndex: {
-              blockTimestamp: new Date(
-                Number(x.blockTimestamp) * 1000,
-              ),
-              logIndex: Number(x.logIndex),
-            },
+        const where = {
+          blockTimestamp_logIndex: {
+            blockTimestamp: new Date(Number(x.blockTimestamp) * 1000),
+            logIndex: Number(x.logIndex),
           },
+        };
+        const evt = await prisma.event.findUnique({
+          where,
           include: { Abi: true },
         });
 
@@ -348,12 +347,20 @@ export async function emitter(
           return undefined;
         }
 
+        if (evt.finalizedAt == null) {
+          logger.debug(
+            `Marking event as finalized at ${blockNumber}, blockNumber: ${x.blockNumber}  logIndex: ${x.logIndex}.`,
+          );
+          await prisma.event.update({
+            where,
+            data: { finalizedAt: Number(blockNumber) },
+          });
+        }
+
         const nextRetryUrls = (await Promise.all(x.url.map((url) => {
           logger.info(
-            `${
-              x.retry
-                ? "Retry posting event"
-                : `Posting event finalized at ${blockNumber}`
+            `${x.retry ? "Retry p" : `P`}osting event finalized at ${
+              evt.finalizedAt ?? blockNumber
             }  destination: ${url}  blockNumber: ${x.blockNumber}  logIndex: ${x.logIndex}.`,
           );
           return fetch(url, {
