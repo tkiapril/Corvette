@@ -347,6 +347,13 @@ export async function emitter(
           return undefined;
         }
 
+        if (evt.emittedAt == null) {
+          logger.warning(
+            `Event already successfully emitted at ${evt.emittedAt}, blockNumber: ${x.blockNumber}  logIndex: ${x.logIndex}.`,
+          );
+          return undefined;
+        }
+
         if (evt.finalizedAt == null) {
           logger.debug(
             `Marking event as finalized at ${blockNumber}, blockNumber: ${x.blockNumber}  logIndex: ${x.logIndex}.`,
@@ -373,6 +380,10 @@ export async function emitter(
           logger.info(
             `Event post success for all webhook URLs, blockNumber: ${x.blockNumber}  logIndex: ${x.logIndex}.`,
           );
+          await prisma.event.update({
+            where,
+            data: { emittedAt: Number(blockNumber) },
+          });
           return undefined;
         } else {
           logger.info(
