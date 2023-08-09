@@ -17,6 +17,7 @@ import {
   toHex,
 } from "npm:viem";
 
+import Prisma from "./prisma-shim.ts";
 import type { PrismaClient } from "./prisma-shim.ts";
 
 import { deserializeControlMessage } from "./ControlMessage.ts";
@@ -123,8 +124,8 @@ export async function emitter(
   );
 
   let finalizationQueue: (
-    & EventMessage
-    & { retry: boolean; url: string[] }
+    & Prisma.EventGetPayload<{ include: { Abi: true } }>
+    & { retry: boolean; where: Prisma.EventWhereUniqueInput; url: string[] }
   )[] = [];
   await amqpChannel.consume(
     { queue: EvmEventsQueueName },
@@ -148,7 +149,7 @@ export async function emitter(
           }  delivery tag: ${args.deliveryTag}.`,
         );
       }
-      emitDestinations.filter((x) =>
+      const destinationUrls = emitDestinations.filter((x) =>
         uint8ArrayEquals(x.sourceAddress as unknown as Uint8Array, address) &&
         uint8ArrayEquals(x.abiHash as unknown as Uint8Array, sigHash) &&
         (x.topic1 == null ||
@@ -160,15 +161,16 @@ export async function emitter(
                     x.topic3 as unknown as Uint8Array,
                     topics[3],
                   ))))))
-      ).forEach((x) => {
+      ).map((x) => x.webhookUrl);
+      for (const url of destinationUrls) {
         if (blockNumber === -1n) {
           // Webhook Test Request
           const sourceAddress = getAddress(toHex(address));
           const abiHash = toHex(sigHash);
           logger.info(
-            `Received webhook test request, address: ${sourceAddress}  event signature hash: ${abiHash}  destination: ${x.webhookUrl}.`,
+            `Received webhook test request, address: ${sourceAddress}  event signature hash: ${abiHash}  destination: ${url}.`,
           );
-          return fetch(x.webhookUrl, {
+          fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: losslessJsonStringify({
@@ -180,6 +182,7 @@ export async function emitter(
               abiHash,
             }),
           });
+          return;
         }
 
         logger.info(
@@ -191,23 +194,54 @@ export async function emitter(
         finalizationQueue = finalizationQueue.map((queuedItem) => {
           if (
             uint8ArrayEquals(queuedItem.blockHash, blockHash) &&
-            queuedItem.logIndex === logIndex
+            queuedItem.logIndex === Number(logIndex)
           ) {
             newEvt = false;
-            if (!queuedItem.url.includes(x.webhookUrl)) {
-              return { ...queuedItem, url: [...queuedItem.url, x.webhookUrl] };
+            if (!queuedItem.url.includes(url)) {
+              return { ...queuedItem, url: [...queuedItem.url, url] };
             }
           }
           return queuedItem;
         });
         if (newEvt) {
+          logger.debug(
+            `Retrieving event from DB, blockNumber: ${blockNumber}  logIndex: ${logIndex}.`,
+          );
+          const where = {
+            blockTimestamp_logIndex: {
+              blockTimestamp: new Date(Number(blockTimestamp) * 1000),
+              logIndex: Number(logIndex),
+            },
+          };
+          const evt = await prisma.event.findUnique({
+            where,
+            include: { Abi: true },
+          });
+
+          if (evt == null) {
+            logger.error(() =>
+              `Event does not exist in DB, blockNumber: ${blockNumber}  logIndex: ${logIndex}  blockHash: ${
+                toHex(blockHash)
+              }  address: ${toHex(address)}  event signature hash: ${
+                toHex(sigHash)
+              }  topics: ${
+                topics.map((topic, i) => [topic, i + 1])
+                  .filter(([topic, _]) => topic != null)
+                  .map(([topic, i]) => `[${i}] ${toHex(topic)}`)
+                  .join(" ")
+              }.`
+            );
+            return undefined;
+          }
+
           finalizationQueue.push({
-            ...message,
+            ...evt,
+            where,
             retry: false,
-            url: [x.webhookUrl],
+            url: [url],
           });
         }
-      });
+      }
       logger.debug(
         `Acknowledging AMQP message for event, blockNumber: ${blockNumber}  logIndex: ${logIndex}  delivery tag: ${args.deliveryTag}.`,
       );
